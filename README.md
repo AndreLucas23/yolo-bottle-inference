@@ -1,2 +1,2 @@
 # yolo-bottle-inference
-Modelo YOLO de inferência de garrafas adulteradas em ambiente industrial com esteiras
+YOLO model for inference of adulterate bottles in industrialized environment with mattings
