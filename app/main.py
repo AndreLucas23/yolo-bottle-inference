@@ -1,23 +1,41 @@
 import asyncio
-from fastapi import FastAPI, HTTPException, Response, Query, Request
-from fastapi.responses import HTMLResponse, StreamingResponse
 import base64
 import io
-import time
+import json
 import subprocess
-from pathlib import Path
-from PIL import Image
-import numpy as np
-import httpx
+import time
+import uuid
+
 import cv2
-
-
+import httpx
+import numpy as np
+from fastapi import FastAPI, HTTPException, Query, Request, Response
+from fastapi.responses import HTMLResponse, StreamingResponse
+from model import get_default_model_name, load_model
+from PIL import Image
 from schemas import (
-    PredictRequest, PredictResponse,
-    BatchPredictRequest, BatchPredictResponse,
-    HealthResponse, MetricsResponse, Detection
+    BatchPredictRequest,
+    BatchPredictResponse,
+    Detection,
+    HealthResponse,
+    MetricsResponse,
+    PredictRequest,
+    PredictResponse,
 )
-from model import load_model, get_default_model_name
+
+from preprocessing.preprocessor import CONFIG_DEFAULT, Preprocessor
+
+
+def log_event(event: str, level: str = "INFO", **kwargs):
+    """Emite um evento estruturado em JSON para stdout."""
+    import time
+    record = {
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "level":     level,
+        "event":     event,
+        **kwargs,
+    }
+    print(json.dumps(record, ensure_ascii=False), flush=True)
 
 
 app = FastAPI(
@@ -29,7 +47,7 @@ app = FastAPI(
 
 _metrics = {"total": 0, "success": 0, "total_ms": 0.0}
 _streaming_lock = asyncio.Lock()
-
+_preprocessor = Preprocessor(CONFIG_DEFAULT)   # instância global
 
 def _decode_image(image_base64: str) -> np.ndarray:
     raw = base64.b64decode(image_base64)
@@ -94,15 +112,29 @@ def _capture_frame_from_camera(device_id: int = 0) -> np.ndarray:
 
 def _run_inference(image_np: np.ndarray, model_name: str, confidence: float) -> PredictResponse:
     model = load_model(model_name)
+
+
+    # Pré-processamento explícito
+    # image_np chega em RGB (já convertido em _decode_image) --
+    # o Preprocessor espera BGR, então converte temporariamente
+    frame_bgr   = image_np[:, :, ::-1]
+    preproc_res = _preprocessor.process(frame_bgr)
+    frame_ready = preproc_res.frame  # RGB, letterboxed
+
+
     t0 = time.perf_counter()
-    results = model(image_np, conf=confidence, verbose=False)
+    results = model(frame_ready, conf=confidence, verbose=False)
     elapsed_ms = (time.perf_counter() - t0) * 1000
 
 
     detections = []
     for r in results:
         for box in r.boxes:
-            coords = box.xyxy[0].tolist()
+            # Ajusta as coordenadas do espaço letterboxed de volta ao
+            # espaço da imagem original -- sem isso, os bboxes retornados
+            # pela API ficam deslocados sempre que houver padding
+            bbox_lb = box.xyxy[0].numpy().reshape(1, 4)
+            bbox_orig = _preprocessor.adjust_boxes(bbox_lb, preproc_res)[0]
             cls_id = int(box.cls[0].item())
             conf_val = float(box.conf[0].item())
 
@@ -110,7 +142,7 @@ def _run_inference(image_np: np.ndarray, model_name: str, confidence: float) -> 
             detections.append(Detection(
                 label=model.names[cls_id],
                 confidence=round(conf_val, 4),
-                bbox=[round(float(c), 2) for c in coords],
+                bbox=[round(float(c), 2) for c in bbox_orig],
             ))
 
 
@@ -140,18 +172,52 @@ async def health_check():
 
 @app.post("/predict", response_model=PredictResponse)
 def predict(request: PredictRequest):
+    request_id = str(uuid.uuid4())[:8]
     _metrics["total"] += 1
+
+
+    log_event("predict_start",
+              request_id=request_id,
+              model=request.model_name,
+              confidence=request.confidence)
+
+
+    if not request.image_base64 and not request.image_url:
+        log_event("predict_error", level="WARN",
+                  request_id=request_id, reason="missing_input")
+        raise HTTPException(status_code=422,
+            detail="Forneça image_base64 ou image_url.")
     try:
-        img = _load_image_from_request(request)
+        if request.image_base64:
+            img = _decode_image(request.image_base64)
+        else:
+            import httpx
+            resp = httpx.get(request.image_url, timeout=10)
+            resp.raise_for_status()
+            img = _decode_image(base64.b64encode(resp.content).decode())
+
+
         result = _run_inference(img, request.model_name, request.confidence)
         _metrics["success"] += 1
         _metrics["total_ms"] += result.inference_ms
+
+
+        log_event("predict_complete",
+                  request_id=request_id,
+                  model=result.model_used,
+                  detections=len(result.detections),
+                  inference_ms=result.inference_ms,
+                  image_size=f"{result.image_width}x{result.image_height}")
         return result
-    except HTTPException:
-        raise
+
+
     except FileNotFoundError as e:
+        log_event("predict_error", level="ERROR",
+                  request_id=request_id, reason=str(e))
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
+        log_event("predict_error", level="ERROR",
+                  request_id=request_id, reason=str(e))
         raise HTTPException(status_code=500, detail=str(e))
 
 
